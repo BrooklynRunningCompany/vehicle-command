@@ -154,12 +154,12 @@ func ExtractCommandAction(ctx context.Context, command string, params RequestPar
 			case "front":
 				return func(v *vehicle.Vehicle) error { return v.OpenFrunk(ctx) }, nil
 			case "rear":
-				return func(v *vehicle.Vehicle) error { return v.OpenTrunk(ctx) }, nil
+				return func(v *vehicle.Vehicle) error { return v.ActuateTrunk(ctx) }, nil
 			default:
 				return nil, &protocol.NominalError{Details: protocol.NewError("invalid_value", false, false)}
 			}
 		}
-		return func(v *vehicle.Vehicle) error { return v.OpenTrunk(ctx) }, nil
+		return func(v *vehicle.Vehicle) error { return v.ActuateTrunk(ctx) }, nil
 	case "charge_port_door_open":
 		return func(v *vehicle.Vehicle) error { return v.ChargePortOpen(ctx) }, nil
 	case "charge_port_door_close":
@@ -317,6 +317,17 @@ func ExtractCommandAction(ctx context.Context, command string, params RequestPar
 			return nil, err
 		}
 		return func(v *vehicle.Vehicle) error { return v.TriggerHomelink(ctx, float32(lat), float32(lon)) }, nil
+		//Window Control
+	case "window_control":
+		cmd, err := params.getString("command", true)
+		if err != nil {
+			return nil, err
+		}
+		if cmd == "vent" {
+			return func(v *vehicle.Vehicle) error { return v.VentWindows(ctx) }, nil
+		} else {
+			return func(v *vehicle.Vehicle) error { return v.CloseWindows(ctx) }, nil
+		}
 	// Updates
 	case "schedule_software_update":
 		offsetSeconds, err := params.getNumber("offset_sec", true)
@@ -335,6 +346,8 @@ func ExtractCommandAction(ctx context.Context, command string, params RequestPar
 	default:
 		return nil, &inet.HttpError{Code: http.StatusBadRequest, Message: "{\"response\":null,\"error\":\"invalid_command\",\"error_description\":\"\"}"}
 	}
+
+
 }
 
 func (p RequestParameters) getString(key string, required bool) (string, error) {
