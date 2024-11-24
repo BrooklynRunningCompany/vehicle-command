@@ -8,9 +8,12 @@ import (
 
 	"github.com/teslamotors/vehicle-command/internal/authentication"
 	"github.com/teslamotors/vehicle-command/pkg/connector"
+	"github.com/teslamotors/vehicle-command/pkg/protocol"
 
 	universal "github.com/teslamotors/vehicle-command/pkg/protocol/protobuf/universalmessage"
 )
+
+var defaultExpiration = 5 * time.Second
 
 // CacheEntry contains information that allows a vehicle session to be resumed without a handshake
 // mesasge (SessionInfoRequest).
@@ -42,8 +45,25 @@ func NewSession(private authentication.ECDHPrivateKey, vin string) (*session, er
 	}, nil
 }
 
+func (s *session) decrypt(message *universal.RoutableMessage, handler *receiver) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	counter, err := s.ctx.Decrypt(message, handler.requestID)
+	if err != nil {
+		return err
+	}
+	if !handler.antireplay.Update(counter) {
+		return protocol.ErrReplayedResponse
+	}
+	return nil
+}
+
 func (s *session) Authorize(ctx context.Context, command *universal.RoutableMessage, method connector.AuthMethod) error {
 	var err error
+	lifetime := defaultExpiration
+	if deadline, ok := ctx.Deadline(); ok {
+		lifetime = time.Until(deadline)
+	}
 	for {
 		attempted := false
 		select {
@@ -56,9 +76,9 @@ func (s *session) Authorize(ctx context.Context, command *universal.RoutableMess
 				case connector.AuthMethodNone:
 					err = nil
 				case connector.AuthMethodGCM:
-					err = s.ctx.Encrypt(command, commandTimeout)
+					err = s.ctx.Encrypt(command, lifetime)
 				case connector.AuthMethodHMAC:
-					err = s.ctx.AuthorizeHMAC(command, commandTimeout)
+					err = s.ctx.AuthorizeHMAC(command, lifetime)
 				default:
 					return errors.New("unrecognized authentication method")
 				}

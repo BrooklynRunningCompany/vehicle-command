@@ -18,7 +18,10 @@ import (
 	"github.com/teslamotors/vehicle-command/pkg/protocol"
 )
 
-func readWithContext(ctx context.Context, r io.Reader, p []byte) ([]byte, error) {
+// MaxLatency is the default maximum latency permitted when updating the vehicle clock estimate.
+var MaxLatency = 10 * time.Second
+
+func ReadWithContext(ctx context.Context, r io.Reader, p []byte) ([]byte, error) {
 	bytesRead := 0
 	for {
 		if ctx.Err() != nil {
@@ -45,7 +48,7 @@ The regular expression below extracts domains from HTTP bodies:
 
 	{
 	  "response": null,
-	  "error": "user out of region, use base URL: https://fleet-api.prd.na.vn.cloud.tesla.com, see https://developer.tesla.com/docs/fleet-api#regional-requirements",
+	  "error": "user out of region, use base URL: https://fleet-api.prd.na.vn.cloud.tesla.com, see https://...",
 	  "error_description": ""
 	}
 */
@@ -74,8 +77,7 @@ func (e *HttpError) Temporary() bool {
 	return e.Code == http.StatusServiceUnavailable ||
 		e.Code == http.StatusGatewayTimeout ||
 		e.Code == http.StatusRequestTimeout ||
-		e.Code == http.StatusMisdirectedRequest ||
-		e.Code == http.StatusTooManyRequests
+		e.Code == http.StatusMisdirectedRequest
 }
 
 func SendFleetAPICommand(ctx context.Context, client *http.Client, userAgent, authHeader string, url string, command interface{}) ([]byte, error) {
@@ -106,7 +108,7 @@ func SendFleetAPICommand(ctx context.Context, client *http.Client, userAgent, au
 	defer result.Body.Close()
 
 	body = make([]byte, connector.MaxResponseLength+1)
-	body, err = readWithContext(ctx, result.Body, body)
+	body, err = ReadWithContext(ctx, result.Body, body)
 	if err != nil {
 		return nil, &protocol.CommandError{Err: err, PossibleSuccess: true, PossibleTemporary: false}
 	}
@@ -181,6 +183,10 @@ func NewConnection(vin string, authHeader, serverURL, userAgent string) *Connect
 
 func (c *Connection) PreferredAuthMethod() connector.AuthMethod {
 	return connector.AuthMethodHMAC
+}
+
+func (c *Connection) AllowedLatency() time.Duration {
+	return MaxLatency
 }
 
 func (c *Connection) RetryInterval() time.Duration {

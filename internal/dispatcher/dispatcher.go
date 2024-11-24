@@ -3,6 +3,7 @@ package dispatcher
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -17,15 +18,15 @@ import (
 	universal "github.com/teslamotors/vehicle-command/pkg/protocol/protobuf/universalmessage"
 )
 
-var sessionInfoRequestTimeout = 5 * time.Second
-var commandTimeout = 5 * time.Second
-
 // Dispatcher objects send (encrypted) messages to a vehicle and route incoming messages to the
 // appropriate receiver object.
 type Dispatcher struct {
 	conn       connector.Connector
 	privateKey authentication.ECDHPrivateKey
 	address    []byte
+
+	latencyLock sync.Mutex
+	maxLatency  time.Duration
 
 	doneLock  sync.Mutex
 	terminate chan struct{}
@@ -42,6 +43,7 @@ type Dispatcher struct {
 func New(conn connector.Connector, privateKey authentication.ECDHPrivateKey) (*Dispatcher, error) {
 	dispatcher := Dispatcher{
 		conn:       conn,
+		maxLatency: conn.AllowedLatency(),
 		address:    make([]byte, addressLength),
 		sessions:   make(map[universal.Domain]*session),
 		handlers:   make(map[receiverKey]*receiver),
@@ -51,10 +53,15 @@ func New(conn connector.Connector, privateKey authentication.ECDHPrivateKey) (*D
 	if _, err := rand.Read(dispatcher.address); err != nil {
 		return nil, err
 	}
-	// Only connections to these domains will be allowed
-	dispatcher.sessions[universal.Domain_DOMAIN_VEHICLE_SECURITY] = nil
-	dispatcher.sessions[universal.Domain_DOMAIN_INFOTAINMENT] = nil
 	return &dispatcher, nil
+}
+
+func (d *Dispatcher) SetMaxLatency(latency time.Duration) {
+	if latency > 0 {
+		d.latencyLock.Lock()
+		d.maxLatency = latency
+		d.latencyLock.Unlock()
+	}
 }
 
 // RetryInterval fetches the transport-layer dependent recommended delay between retry attempts.
@@ -70,6 +77,7 @@ func (d *Dispatcher) StartSession(ctx context.Context, domain universal.Domain) 
 	s, ok := d.sessions[domain]
 	if !ok {
 		d.sessions[domain], err = NewSession(d.privateKey, d.conn.VIN())
+		s = d.sessions[domain]
 	} else if s != nil && s.ctx != nil {
 		log.Info("Session for %s loaded from cache", domain)
 		sessionReady = true
@@ -78,16 +86,27 @@ func (d *Dispatcher) StartSession(ctx context.Context, domain universal.Domain) 
 	if err != nil || sessionReady {
 		return err
 	}
-	recv, err := d.RequestSessionInfo(ctx, domain)
-	if err != nil {
-		return err
-	}
-	defer recv.Close()
-	select {
-	case reply := <-recv.Recv():
-		return protocol.GetError(reply)
-	case <-ctx.Done():
-		return ctx.Err()
+	for {
+		recv, err := d.RequestSessionInfo(ctx, domain)
+		if err != nil {
+			return err
+		}
+		defer recv.Close()
+		select {
+		case reply := <-recv.Recv():
+			if err = protocol.GetError(reply); err != nil {
+				return err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.readySignal:
+			return nil
+		}
+		select {
+		case <-time.After(d.conn.RetryInterval()):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }
 
@@ -110,16 +129,19 @@ func (d *Dispatcher) StartSessions(ctx context.Context, domains []universal.Doma
 			results <- d.StartSession(aggregateContext, dom)
 		}(domain)
 	}
+	var err error
 	for i := 0; i < len(domains); i++ {
-		err := <-results
-		if err != nil {
+		err = <-results
+		// The aggregateContext is canceled if one of the handshakes fails. We don't want to return
+		// the Canceled error if ErrProtocolNotSupported is present.
+		if err != nil && !errors.Is(err, context.Canceled) {
 			return err
 		}
 	}
-	return nil
+	return err
 }
 
-func (d *Dispatcher) createHandler(key *receiverKey) *receiver {
+func (d *Dispatcher) createHandler(key *receiverKey, id []byte) *receiver {
 	d.handlerLock.Lock()
 	defer d.handlerLock.Unlock()
 
@@ -130,6 +152,7 @@ func (d *Dispatcher) createHandler(key *receiverKey) *receiver {
 		dispatcher:    d,
 		requestSentAt: now,
 		lastActive:    now,
+		requestID:     id,
 	}
 
 	d.handlers[*key] = recv
@@ -149,6 +172,20 @@ func (d *Dispatcher) checkForSessionUpdate(message *universal.RoutableMessage, h
 		return
 	}
 
+	if d.privateKey == nil {
+		log.Warning("[%02x] Discarding session info because client does not have a private key", message.GetRequestUuid())
+		return
+	}
+
+	d.latencyLock.Lock()
+	maxLatency := d.maxLatency
+	d.latencyLock.Unlock()
+
+	if handler.expired(maxLatency) {
+		log.Warning("[%02x] Discarding session info because it was received more than %s after request", message.GetRequestUuid(), maxLatency)
+		return
+	}
+
 	tag := message.GetSignatureData().GetSessionInfoTag().GetTag()
 	if tag == nil {
 		log.Warning("[%02x] Discarding unauthenticated session info", message.GetRequestUuid())
@@ -164,20 +201,30 @@ func (d *Dispatcher) checkForSessionUpdate(message *universal.RoutableMessage, h
 		return
 	}
 
-	if session == nil {
-		if session, err = NewSession(d.privateKey, d.conn.VIN()); err != nil {
-			log.Error("[%02x] Error creating new session: %s", message.GetRequestUuid(), err)
-			return
-		}
-		d.sessions[domain] = session
-	}
-
 	if err = session.ProcessHello(message.GetRequestUuid(), sessionInfo, tag); err != nil {
 		log.Warning("[%02x] Session info error: %s", message.GetRequestUuid(), err)
-		d.sessions[domain] = nil
 		return
 	}
 	log.Info("[%02x] Updated session info for %s", message.GetRequestUuid(), domain)
+}
+
+func (d *Dispatcher) decrypt(message *universal.RoutableMessage, handler *receiver) error {
+	decryptionData := message.GetSignatureData().GetAES_GCM_ResponseData()
+	if decryptionData == nil {
+		return nil
+	}
+
+	domain := handler.key.domain
+
+	d.sessionLock.Lock()
+	defer d.sessionLock.Unlock()
+
+	session, ok := d.sessions[domain]
+	if !ok {
+		return protocol.ErrNoDecryptionContext
+	}
+
+	return session.decrypt(message, handler)
 }
 
 func (d *Dispatcher) process(message *universal.RoutableMessage) {
@@ -234,8 +281,15 @@ func (d *Dispatcher) process(message *universal.RoutableMessage) {
 	// have been a desync. This typically accompanies an error message, and so
 	// the reply still needs to be passed down to the handler after updating
 	// session info.
-	if !handler.expired() && d.privateKey != nil {
-		d.checkForSessionUpdate(message, handler)
+	d.checkForSessionUpdate(message, handler)
+
+	// Decryption is a no-op for plaintext messages
+	if err := d.decrypt(message, handler); err == protocol.ErrReplayedResponse {
+		log.Info("[%02x] Dropping duplicate vehicle response", requestUUID)
+		return
+	} else if err != nil {
+		log.Warning("[%02x] Error decrypting vehicle response: %s", requestUUID, err)
+		return
 	}
 
 	select {
@@ -346,8 +400,13 @@ func (d *Dispatcher) Send(ctx context.Context, message *universal.RoutableMessag
 	if auth != connector.AuthMethodNone {
 		d.sessionLock.Lock()
 		session, ok := d.sessions[message.GetToDestination().GetDomain()]
+		if ok {
+			session.lock.Lock()
+			ok = session.ready
+			session.lock.Unlock()
+		}
 		d.sessionLock.Unlock()
-		if !ok || session == nil {
+		if !ok {
 			log.Warning("No session available for %s", message.GetToDestination().GetDomain())
 			return nil, protocol.ErrNoSession
 		}
@@ -356,7 +415,7 @@ func (d *Dispatcher) Send(ctx context.Context, message *universal.RoutableMessag
 		}
 	}
 
-	resp := d.createHandler(&key)
+	resp := d.createHandler(&key, authentication.RequestID(message))
 	encodedMessage, err := proto.Marshal(message)
 	if err != nil {
 		return nil, err
